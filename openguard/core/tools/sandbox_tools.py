@@ -1,0 +1,350 @@
+import os
+import subprocess
+from .base import openguard_tool
+from ..config import OFFICE_DIR
+from ..logger import audit_logger
+import re
+import shlex
+import platform
+
+SYS_OS = platform.system()
+
+def _get_safe_path(relative_path: str) -> str:
+    """
+    将模型传入的相对路径转换为绝对路径，并死死检查它是否越界！
+    如果模型尝试传入 "../../etc/passwd"，这里会直接把它拦截。
+    """
+    from pathlib import Path
+    import ntpath
+    if os.path.isabs(relative_path) or ntpath.isabs(relative_path) or ntpath.splitdrive(relative_path)[0]:
+        raise PermissionError("仅允许 office 内的相对路径")
+    base_dir = Path(OFFICE_DIR).resolve()
+    target = (base_dir / relative_path).resolve()
+    if not target.is_relative_to(base_dir):
+        raise PermissionError(f"越权拦截：路径 {relative_path!r} 位于 office 之外")
+    return str(target)
+
+
+
+# ============ 命令白名单（P0-1/P0-3：正则黑名单 -> 结构化校验） ============
+
+# 紧凑必需集：文件 CRUD / 搜索 / 受限解释器 / 杂项，双语系覆盖
+_ALLOWED_COMMANDS = {
+    # 查看
+    "ls", "dir", "cat", "type", "pwd",
+    # 文件 CRUD
+    "mv", "move", "rm", "del", "cp", "copy", "mkdir", "md", "rmdir", "rd", "touch",
+    # 搜索
+    "grep", "findstr", "find",
+    # 解释器（受限：仅允许跑 office 内脚本文件，见 _validate_interpreter_segment）
+    "python", "python3", "py", "node",
+    # 杂项
+    "echo",
+}
+
+# 解释器命令：参数必须落在 office 内
+_INTERPRETERS = {"python", "python3", "py", "node"}
+
+# 解释器禁止的参数形态：内联代码与模块加载都是任意代码执行入口
+_INTERPRETER_FORBIDDEN_FLAGS = {"-c", "-e", "-m"}
+
+# 通道封杀：环境变量展开（$VAR / %VAR%）、命令替换（反引号 / $(...) / <(...)）
+# 字符级拒绝——这些内容在 shell 解释前就被拦下，不存在"展开后检查"的窗口
+_EXPANSION_PATTERN = re.compile(r"\$|`|<\(|>\(")
+
+# 操作符切段：&& || ; & | ——复合命令每一段都要独立过白名单
+_SEGMENT_SPLIT_PATTERN = re.compile(r"&&|\|\||[;&|]")
+
+# 路径越界参数：绝对路径（Unix 根 / Windows 盘符或反斜杠根）与上跳（..）
+_PATH_ESCAPE_PATTERN = re.compile(r"(?:^|\s|=)(/|\\|[a-zA-Z]:[\\/])|\.\.")
+
+# 重定向目标约束：> file / < file 的 file 必须是 office 内相对路径
+_REDIRECTION_TARGET_PATTERN = re.compile(r"[<>]{1,2}\s*([^\s;|&]+)")
+
+
+def _load_extended_commands():
+    """
+    读取环境变量追加的白名单命令（OPENGUARD_ALLOWED_COMMANDS，逗号分隔）。
+    首次读取到非空扩展时记审计日志——扩展白名单是一次显式的人工授权，必须留痕。
+    """
+    raw = os.getenv("OPENGUARD_ALLOWED_COMMANDS", "")
+    extended = {c.strip().lower() for c in raw.split(",") if c.strip()}
+    if extended:
+        audit_logger.log_event(
+            thread_id="system",
+            event="system_action",
+            content=f"shell 白名单扩展生效（OPENGUARD_ALLOWED_COMMANDS）: {sorted(extended)}"
+        )
+    return extended
+
+
+_EXTENDED_COMMANDS = _load_extended_commands()
+_ALLOWED_COMMANDS |= _EXTENDED_COMMANDS
+
+
+def _is_relative_office_path(arg: str) -> bool:
+    """
+    判断一个命令参数是否是 office 内相对路径：
+    不允许绝对路径（Unix / Windows 盘符）、上跳（..）与用户主目录（~）。
+    """
+    if not arg:
+        return True
+    if _PATH_ESCAPE_PATTERN.search(arg):
+        return False
+    # Windows 盘符（D:x 形态）与网络路径
+    if re.match(r"^[a-zA-Z]:", arg):
+        return False
+    # 用户主目录（~ / ~/xxx / "~..." 引号内形态）——展开后必然越界
+    if arg.lstrip("\"'").startswith("~"):
+        return False
+    return True
+
+
+def _validate_interpreter_segment(tokens):
+    """
+    解释器段专用校验：拒绝 -c/-e/-m（内联代码/模块加载），
+    脚本参数必须是 office 内相对路径（无 .. 无绝对路径）。
+    """
+    flags_and_args = tokens[1:]
+    if not flags_and_args:
+        raise PermissionError(
+            "解释器命令必须指定 office 内的脚本文件（禁止裸启动）"
+        )
+    for arg in flags_and_args:
+        if arg.lower() in _INTERPRETER_FORBIDDEN_FLAGS:
+            raise PermissionError(
+                f"解释器禁止内联代码/模块加载参数（{arg}）。"
+                f"请先把代码写入 office 内文件再执行。"
+            )
+        if not _is_relative_office_path(arg):
+            raise PermissionError(
+                f"解释器参数越界: {arg!r}。脚本必须位于 office 工位内。"
+            )
+
+
+def _validate_segment(segment: str):
+    """
+    校验单个命令段：解析出首 token（命令名）过白名单；
+    参数做 office 内路径约束；解释器段走更严格的专用校验。
+    """
+    try:
+        tokens = shlex.split(segment, posix=False)
+    except ValueError as e:
+        raise PermissionError(f"命令解析失败: {e}")
+
+    if not tokens:
+        return
+
+    # 命令必须使用白名单中的裸名称；不接受可替换二进制的路径前缀
+    head = tokens[0]
+    if any(separator in head for separator in ("/", "\\")) or ":" in head:
+        raise PermissionError("命令名不得携带路径前缀")
+    head_name = os.path.basename(head.replace("\\", "/").strip('"\''))
+
+    if head_name.lower() not in _ALLOWED_COMMANDS:
+        raise PermissionError(
+            f"命令 '{head_name}' 不在允许清单内。office 沙盒仅放行白名单命令；"
+            f"如需扩展，请设置 OPENGUARD_ALLOWED_COMMANDS 环境变量。"
+        )
+
+    if head_name.lower() in _INTERPRETERS:
+        _validate_interpreter_segment(tokens)
+        return
+
+    # 非解释器命令：参数里的路径同样不许越界
+    for arg in tokens[1:]:
+        if not _is_relative_office_path(arg):
+            raise PermissionError(
+                f"参数越界: {arg!r}。所有路径必须限制在 office 工位内。"
+            )
+
+
+def _validate_command(command: str):
+    """
+    结构化命令白名单（替代旧正则黑名单"五条杀招"）：
+
+    1. 封死展开/替换通道（$ ` %(成对) <( >() ——这些字符在 shell 解释前即被拒
+    2. 重定向目标必须是 office 内相对路径
+    3. shlex 解析后按 && || ; & | 切段，每段独立校验
+    4. 每段首 token（命令名）必须在白名单内
+    5. 解释器段额外拒绝 -c/-e/-m 与越界脚本路径
+
+    校验通过返回 None；任何违规抛 PermissionError。
+    """
+    if not command or not command.strip():
+        raise PermissionError("空命令")
+
+    # 通道封杀：$ 与反引号与进程替换
+    if _EXPANSION_PATTERN.search(command):
+        raise PermissionError(
+            "检测到环境变量展开或命令替换语法（$ ` <( >()，已封禁。"
+            "请使用字面量参数。"
+        )
+
+    # 通道封杀：cmd 风格 %VAR% 展开（成对出现才算变量，单词内孤立 % 不算）
+    if re.search(r"%[^%\s]{1,}%", command):
+        raise PermissionError(
+            "检测到 cmd 变量展开语法（%VAR%），已封禁。请使用字面量参数。"
+        )
+
+    # 重定向目标：> file / < file 的目标必须落在 office 内
+    for match in _REDIRECTION_TARGET_PATTERN.finditer(command):
+        target = match.group(1)
+        if not _is_relative_office_path(target):
+            raise PermissionError(
+                f"重定向目标越界: {target!r}。输出必须落在 office 工位内。"
+            )
+
+    # 复合命令切段：每段独立过白名单
+    segments = _SEGMENT_SPLIT_PATTERN.split(command)
+    for segment in segments:
+        stripped = segment.strip()
+        if stripped:
+            _validate_segment(stripped)
+
+@openguard_tool
+def list_office_files(sub_dir: str = "") -> str:
+    """
+    查看你的 office 工位里有哪些文件和文件夹。
+    如果 sub_dir 为空，则查看工位根目录。
+    """
+    try:
+        target_dir = _get_safe_path(sub_dir)
+        if not os.path.exists(target_dir):
+            return f"目录不存在：{sub_dir}"
+        
+        items = os.listdir(target_dir)
+        if not items:
+            return f"[{sub_dir if sub_dir else 'office 根目录'}] 是空的。"
+        
+        # 格式化输出，标注是文件还是文件夹
+        result = []
+        for item in items:
+            item_path = os.path.join(target_dir, item)
+            item_type = "📁" if os.path.isdir(item_path) else "📄"
+            result.append(f"{item_type} {item}")
+            
+        return "\n".join(result)
+    except Exception as e:
+        return str(e)
+    
+@openguard_tool
+def read_office_file(filepath: str) -> str:
+    """
+    读取 office 工位里指定文件的内容。
+    filepath 参数应该是相对于 office 的路径，例如 "test.py" 或 "skills/my_skill.py"。
+    """
+    try:
+        target_path = _get_safe_path(filepath)
+        if not os.path.exists(target_path):
+            return f"文件不存在：{filepath}"
+        
+        with open(target_path, "r", encoding="utf-8") as f:
+            content = f.read(10001)
+            # 防爆截断：防止读取几个 G 的日志把 Token 撑爆
+            if len(content) > 10000:
+                return content[:10000] + "\n\n...[内容过长，已被安全截断]..."
+            return content
+    except Exception as e:
+        return str(e)
+    
+@openguard_tool
+def write_office_file(filepath: str, content: str, mode: str = "w") -> str:
+    """
+    在 office 工位里操作文件内容。
+    
+    参数说明:
+    - filepath: 相对路径，例如 "spider.py" 或 "docs/readme.md"。
+    - content: 要写入的具体文本或代码内容。
+    - mode: 写入模式。
+        - "w" (默认): 【覆盖/新建】模式。如果文件已存在，将彻底清空原内容并写入新内容！
+        - "a": 【追加】模式。保留原内容，将新内容追加到文件最末尾（常用于写日志或在文件末尾新增函数）。
+        
+    ⚠️ 智能体操作规范：
+    1. 如果你要修改一个长文件中间的某几行，目前最安全的做法是：读取原文件，在你的内存中完成替换，然后用 "w" 模式把【完整的最新代码】重写进去。
+    2. 如果你需要重命名文件或删除文件，请直接使用 execute_office_shell 工具执行 `mv` 或 `rm` 命令。
+    3. 禁止编写 与 跳出office工位 相关的任何语言脚本！
+    """
+    try:
+        target_path = _get_safe_path(filepath)
+        
+        # 严格校验传入的 mode
+        if mode not in ["w", "a"]:
+             return "❌ 错误：mode 参数必须是 'w' (覆盖) 或 'a' (追加)。"
+        
+        # 如果模型想在子目录里写文件，确保子目录存在
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        
+        with open(target_path, mode, encoding="utf-8") as f:
+            # 如果是追加模式，且内容不是以换行符开头，自动补一个换行，防止代码粘连
+            if mode == "a" and not content.startswith("\n"):
+                f.write("\n" + content)
+            else:
+                f.write(content)
+                
+        action = "覆盖/新建" if mode == "w" else "追加"
+        return f" ● 成功以 {action} 模式写入文件：{filepath} (共 {len(content)} 字符)"
+    except Exception as e:
+        return str(e)
+    
+
+@openguard_tool
+def execute_office_shell(command: str) -> str:
+    """
+    在 office 工位中执行 Shell 命令（结构化命令白名单管控）。
+
+    ⚠️ 【执行边界（代码强制，非约定）】：
+    1. 命令名白名单：仅放行 ls/dir/cat/type/mv/rm/cp/mkdir/grep/findstr/python/node 等办公与脚本命令，清单外命令一律拒绝。
+    2. 通道封禁：$VAR、%VAR%、反引号、$(...)、<(...) 等展开/替换语法一律拒绝——请直接使用字面量参数。
+    3. 路径约束：所有参数与重定向目标必须位于 office 工位内（相对路径，无 .. 无绝对路径）。
+    4. 解释器受限：python/node 仅允许执行 office 内的脚本文件，禁止 -c/-e/-m 内联代码与模块加载。
+    5. 复合命令（&& || ; |）：每一段都独立过上述校验。
+    6. 💻 跨平台注意：宿主机可能是 Windows/Linux/Mac，请使用对应原生命令（Win 用 dir/del，Linux 用 ls/rm）。
+    7. 非交互式终端：所有命令必须携带免确认参数（如 -y, --quiet）。
+    8. [无状态警告] 每次执行都是独立的终端进程！需要进入子目录请使用"命令链"或相对路径。
+
+    如需运行白名单外的命令，部署者可设置环境变量 OPENGUARD_ALLOWED_COMMANDS（逗号分隔）扩展白名单，扩展生效会记入审计日志。
+    """
+    try:
+        try:
+            _validate_command(command)
+        except PermissionError as e:
+            return f"❌ 权限拒绝：{e} 你只能在 office 工位内使用白名单命令。"
+
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=OFFICE_DIR,
+            capture_output=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=60
+        )
+        
+        output = f" ● 当前系统: {SYS_OS}\n"
+        output += f" ● 执行命令: `{command}`\n"
+        output += f" ● 退出码 (Exit Code): {result.returncode}\n"
+        
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        
+        if result.returncode != 0 and ("prompt" in stderr.lower() or "y/n" in stdout.lower()):
+            output += "\n💡 系统提示：命令可能由于交互式等待而失败。请重试并添加 -y 参数！"
+        
+        if stdout:
+            output += f"\n[STDOUT]\n{stdout[-2000:] if len(stdout) > 2000 else stdout}"
+        if stderr:
+            output += f"\n[STDERR]\n{stderr[-2000:] if len(stderr) > 2000 else stderr}"
+            
+        if not stdout and not stderr:
+            if result.returncode == 0:
+                output += "\n(静默执行完毕：无终端输出)"
+            else:
+                output += "\n(异常退出：Exit Code 非 0，无错误日志输出)"
+            
+        return output
+        
+    except subprocess.TimeoutExpired:
+        return "❌ 严重错误：命令执行超时（60s）被熔断！请检查是否有阻塞式交互。"
+    except Exception as e:
+        return f"❌ 执行异常：{str(e)}"

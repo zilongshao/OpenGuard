@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="180" viewBox="0 0 960 180" role="img" aria-labelledby="title desc">
+  <title id="title">OpenGuard</title>
+  <desc id="desc">OpenGuard shield logo and wordmark</desc>
+  <rect width="960" height="180" rx="24" fill="#111827"/>
+  <path d="M90 28 143 48v40c0 34-21 55-53 68-32-13-53-34-53-68V48Z" fill="#22d3ee"/>
+  <path d="M90 46 127 60v28c0 23-13 39-37 50-24-11-37-27-37-50V60Z" fill="#111827"/>
+  <path d="m70 90 14 14 27-30" fill="none" stroke="#a78bfa" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="180" y="114" fill="#f9fafb" font-family="Arial, Helvetica, sans-serif" font-size="74" font-weight="700" letter-spacing="-2">Open<tspan fill="#a78bfa">Guard</tspan></text>
+</svg>
